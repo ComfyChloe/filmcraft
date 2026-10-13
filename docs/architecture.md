@@ -307,8 +307,9 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   hardware enumeration and are configured one output type at a time. The same opt-in rules apply
   (Export ▸ Hardware encoding for H.264, the format choice for H.265), and its H.265 probe is a second
   alternative for `Format::Hevc`, so the format is offered wherever *either* encoder opens a session.
-  An encoder that reorders frames is declined by the presentation-time check rather than writing wrong
-  timestamps. `mfcaps` lists the machine's encoder MFTs.
+  An encoder that runs a fixed number of pictures behind is taken, with the delay written as an edit
+  list; one whose delay changes is reordering and is declined by the presentation-time check rather
+  than writing wrong timestamps. `mfcaps` lists the machine's encoder MFTs.
 - **Compositor.** `render` is the reference for monitors, thumbnails and export. `render::plan`
   turns a frame into GPU layers, each with its opacity and blend mode. All 27 blend modes run on the
   GPU (`filmcraft-gpu`): Normal and Dissolve with fixed-function "over" blending, the others by
