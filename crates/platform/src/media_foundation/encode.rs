@@ -256,11 +256,11 @@ fn time_100ns(rate: FrameRate, index: u64) -> i64 {
 fn declined(why: &str, hard: bool) -> Option<Result<Box<dyn VideoEncoder>>> {
     if hard {
         log::info!("hardware H.265 encoding declined: {why}");
-        filmcraft_export::note_hw_encode_declined();
+        filmcraft_export::note_hw_encode_declined_with(why);
         Some(Err(ExportError::Unsupported(format!("H.265 export with Media Foundation: {why}"))))
     } else {
         log::info!("hardware encoding declined: {why}");
-        filmcraft_export::note_hw_encode_declined();
+        filmcraft_export::note_hw_encode_declined_with(why);
         None
     }
 }
@@ -377,6 +377,11 @@ impl MfVideoEncoder {
 }
 
 impl VideoEncoder for MfVideoEncoder {
+    /// This is the Media Foundation encoder MFT: the export result says so, so a file written by
+    /// it is not mistaken for one written by FilmCraft's own encoder.
+    fn name(&self) -> &'static str {
+        "Media Foundation"
+    }
     fn sample_entry(&self) -> SampleEntry {
         // Only complete once the encoder has written its parameter sets; the export asks again
         // after the first picture, which is when they exist.
