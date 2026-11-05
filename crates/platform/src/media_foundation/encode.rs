@@ -11,6 +11,10 @@
 //!   counted as declined and ends the export with an error that says why; when the machine has no
 //!   HEVC encoder at all, [`hevc_available`] says so and the factory returns `None`.
 //!
+//! Whether the machine has an encoder at all is decided by a probe that **encodes a picture** with
+//! it, not by one that opens a session: an encoder MFT that opens and then refuses every picture
+//! would otherwise be offered the format and fail every export on the first picture.
+//!
 //! A hardware encoder that fails in the middle of an export ends the export with an error naming
 //! it: like NVENC's, it cannot be replayed into the software encoder, because the two write
 //! different streams.
@@ -52,6 +56,12 @@ const FRAME_WAIT: std::time::Duration = std::time::Duration::ZERO;
 const INPUT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// One bounded output/event pump while waiting for a full input queue to accept a picture.
 const IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(30);
+/// How long the availability probe waits for the encoder to hand its test pictures back. Generous:
+/// the first pictures of a session are the slowest, and the probe only runs once per format.
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How many pictures the availability probe sends. More than one, so that an encoder which wants a
+/// second picture before it produces anything is not mistaken for a broken one.
+const PROBE_PICTURES: u64 = 3;
 
 /// What the encoder is asked for, or why it is not used for that export.
 struct Config {
@@ -155,6 +165,16 @@ pub fn factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettin
         Ok(a) => a,
         Err(why) => return declined(&why, hard),
     };
+    // The availability probe has the encoder encode a picture, so an encoder that opens but cannot
+    // encode is not offered the format at all. Without this, a machine with a broken vendor
+    // encoder — an Intel UHD 750 whose HEVC MFT opens and then refuses every picture — would fail
+    // an export half way through instead of falling back to the software encoder.
+    if !(if hard { hevc_available() } else { h264_available() }) {
+        let why = if hard { "no hardware H.265 encoder that can encode a picture" } else { "no hardware H.264 encoder that can encode a picture" };
+        log::info!("{why}");
+        // H.265 has no software encoder to fall back to, so the format is simply not available.
+        return if hard { None } else { declined(why, false) };
+    }
     let spec = EncSpec {
         subtype: cfg.subtype,
         profile: cfg.profile,
@@ -166,16 +186,7 @@ pub fn factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettin
     };
     let mft = match super::open(api, &spec) {
         Ok(m) => m,
-        Err(why) => {
-            // no HEVC encoder here at all: not a hardware attempt, the export's own "encoder not
-            // available" error
-            return if hard && !hevc_available() {
-                log::info!("no hardware H.265 encoder: {why}");
-                None
-            } else {
-                declined(&why, hard)
-            };
-        }
+        Err(why) => return declined(&why, hard),
     };
     log::info!("hardware {} encoding on {}", if hard { "H.265" } else { "H.264" }, mft.name());
     filmcraft_export::note_hw_encode_session();
@@ -274,6 +285,33 @@ struct Planes {
     nv12: Vec<u8>,
 }
 
+/// One RGBA picture converted into `planes.nv12`, returning how many bytes it holds.
+///
+/// Free-standing, so that the availability probe can convert a picture exactly the way an export
+/// does without an export's encoder around it.
+fn pack_nv12(planes: &mut Planes, rgba: &[u8], width: u32, height: u32) -> Result<usize> {
+    let (w, h) = (width as usize, height as usize);
+    if rgba.len() < w.saturating_mul(h).saturating_mul(4) {
+        return Err(ExportError::Encode("the RGBA picture is smaller than its size".into()));
+    }
+    filmcraft_export::timed(filmcraft_export::Stage::Convert, || filmcraft_export::rgba_to_yuv420_8(rgba, w, h, &mut planes.y, &mut planes.u, &mut planes.v));
+    let luma = w * h;
+    let needed = luma + luma / 2;
+    if planes.nv12.len() < needed {
+        planes.nv12.resize(needed, 0);
+    }
+    planes.nv12[..luma].copy_from_slice(&planes.y[..luma]);
+    // 4:2:0 chroma, interleaved and subsampled: the U and V of two pixels share two bytes
+    for row in 0..h / 2 {
+        let (src, dst) = (row * (w / 2), luma + row * w);
+        for col in 0..w / 2 {
+            planes.nv12[dst + col * 2] = planes.u[src + col];
+            planes.nv12[dst + col * 2 + 1] = planes.v[src + col];
+        }
+    }
+    Ok(needed)
+}
+
 /// The Media Foundation encoder as an Export encoder: RGBA pictures in, MP4 samples out.
 struct MfVideoEncoder {
     mft: MfEncoder,
@@ -344,29 +382,7 @@ impl MfVideoEncoder {
                 f.width, f.height, self.cfg.size.0, self.cfg.size.1
             )));
         }
-        let (w, h) = (self.cfg.size.0 as usize, self.cfg.size.1 as usize);
-        if f.rgba.len() < w.saturating_mul(h).saturating_mul(4) {
-            return Err(ExportError::Encode("the RGBA picture is smaller than its size".into()));
-        }
-        filmcraft_export::timed(filmcraft_export::Stage::Convert, || {
-            filmcraft_export::rgba_to_yuv420_8(f.rgba, w, h, &mut self.planes.y, &mut self.planes.u, &mut self.planes.v)
-        });
-        let p = &mut self.planes;
-        let luma = w * h;
-        let needed = luma + luma / 2;
-        if p.nv12.len() < needed {
-            p.nv12.resize(needed, 0);
-        }
-        p.nv12[..luma].copy_from_slice(&p.y[..luma]);
-        // 4:2:0 chroma, interleaved and subsampled: the U and V of two pixels share two bytes
-        for row in 0..h / 2 {
-            let (src, dst) = (row * (w / 2), luma + row * w);
-            for col in 0..w / 2 {
-                p.nv12[dst + col * 2] = p.u[src + col];
-                p.nv12[dst + col * 2 + 1] = p.v[src + col];
-            }
-        }
-        Ok(needed)
+        pack_nv12(&mut self.planes, f.rgba, self.cfg.size.0, self.cfg.size.1)
     }
 
     /// Everything the MFT has finished, as MP4 samples, waiting up to `budget` for an asynchronous one.
@@ -447,22 +463,85 @@ fn check_drain_count(submitted: u64, written: u64) -> Result<()> {
 static HEVC_PROBE: OnceLock<bool> = OnceLock::new();
 static H264_PROBE: OnceLock<bool> = OnceLock::new();
 
-/// Whether this machine has a hardware H.264 encoder, by opening a small session (asked once).
-/// A machine has an H.264 encoder or an HEVC one or both; a caller counting which factory takes
-/// an export needs to know whether anything will before the software encoder does.
+/// What the H.264 availability probe asks for: the plainest H.264 there is, so that a machine
+/// whose encoder is old enough to refuse a profile is not judged by it.
+fn h264_probe_spec() -> EncSpec {
+    EncSpec {
+        subtype: windows::Win32::Media::MediaFoundation::MFVideoFormat_H264,
+        profile: None,
+        label: "H.264",
+        size: (640, 360),
+        rate: (30, 1),
+        bitrate: 2_000_000,
+        cbr: false,
+    }
+}
+
+/// What the HEVC availability probe asks for.
+fn hevc_probe_spec() -> EncSpec {
+    EncSpec {
+        subtype: windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC,
+        profile: None,
+        label: "H.265",
+        size: (640, 360),
+        rate: (30, 1),
+        bitrate: 2_000_000,
+        cbr: false,
+    }
+}
+
+/// Whether the machine's encoder can really encode, not merely open a session. Returns how many
+/// access units the encoder gave back.
+///
+/// Opening a session proves that the MFT exists and that its media types can be negotiated. It does
+/// **not** prove that the encoder works: on an Intel UHD 750 the "Intel Hardware H265 Encoder MFT"
+/// opens without complaint, so a probe that only opened offered H.265 on a machine where every
+/// export then failed on the first picture — `ProcessInput failed: Unspecified error (0x80004005)`,
+/// at every size and rate mode, and `ffmpeg`'s own `hevc_mf` failed on the same MFT. So the probe
+/// sends pictures and waits for the encoder to give them back, and a machine that cannot encode
+/// does not offer the format.
+fn probe(api: &'static MfApi, spec: &EncSpec) -> std::result::Result<usize, String> {
+    let mut mft = super::open(api, spec)?;
+    let (w, h) = spec.size;
+    // A black picture: the probe is about whether the encoder runs, not about what it looks like.
+    let rgba = vec![0u8; (w as usize).saturating_mul(h as usize).saturating_mul(4)];
+    let mut planes = Planes::default();
+    let needed = pack_nv12(&mut planes, &rgba, w, h).map_err(|e| e.to_string())?;
+    let rate = FrameRate { num: i64::from(spec.rate.0), den: i64::from(spec.rate.1) };
+    let deadline = std::time::Instant::now() + INPUT_WAIT;
+    for index in 0..PROBE_PICTURES {
+        let time = time_100ns(rate, index);
+        loop {
+            match mft.try_input(api, &planes.nv12[..needed], time) {
+                Ok(Input::Taken) => break,
+                // The input queue is full: the encoder wants its output taken before it takes more.
+                Ok(Input::Full) => {
+                    let _ = mft.wait(api, IDLE_WAIT)?;
+                    if std::time::Instant::now() > deadline {
+                        return Err("the encoder did not take the picture".into());
+                    }
+                }
+                Err(why) => return Err(why),
+            }
+        }
+    }
+    // Drain, so the encoder flushes what it holds, then wait for the pictures to come back: an
+    // encoder that takes a picture and gives nothing back is as broken as one that refuses it.
+    mft.drain()?;
+    let frames = mft.wait(api, PROBE_WAIT)?;
+    if frames.is_empty() {
+        return Err("the encoder took the pictures and gave nothing back".into());
+    }
+    Ok(frames.len())
+}
+
+/// Whether this machine has a hardware H.264 encoder, by encoding one picture with it (asked
+/// once). A machine has an H.264 encoder or an HEVC one or both; a caller counting which factory
+/// takes an export needs to know whether anything will before the software encoder does.
 pub fn h264_available() -> bool {
     *H264_PROBE.get_or_init(|| {
         let Ok(api) = super::mft::api() else { return false };
-        let spec = EncSpec {
-            subtype: windows::Win32::Media::MediaFoundation::MFVideoFormat_H264,
-            profile: Some(windows::Win32::Media::MediaFoundation::eAVEncH264VProfile_High.0 as u32),
-            label: "H.264",
-            size: (640, 360),
-            rate: (30, 1),
-            bitrate: 2_000_000,
-            cbr: false,
-        };
-        match super::open(api, &spec) {
+        match probe(api, &h264_probe_spec()) {
             Ok(_) => true,
             Err(why) => {
                 log::info!("no Media Foundation hardware H.264 encoder: {why}");
@@ -473,14 +552,12 @@ pub fn h264_available() -> bool {
 }
 
 /// Whether this machine has a hardware HEVC encoder, which is what makes `Format::Hevc` available
-/// (asked once, by creating a small session). Registered alongside NVENC's probe, so a machine with
-/// either encoder offers the format.
+/// (asked once, by encoding one picture with it). Registered alongside NVENC's probe, so a machine
+/// with either encoder offers the format.
 pub fn hevc_available() -> bool {
     *HEVC_PROBE.get_or_init(|| {
         let Ok(api) = super::mft::api() else { return false };
-        use windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC;
-        let spec = EncSpec { subtype: MFVideoFormat_HEVC, profile: None, label: "H.265", size: (640, 360), rate: (30, 1), bitrate: 2_000_000, cbr: false };
-        match super::open(api, &spec) {
+        match probe(api, &hevc_probe_spec()) {
             Ok(_) => true,
             Err(why) => {
                 log::info!("no Media Foundation hardware HEVC encoder: {why}");
@@ -726,5 +803,64 @@ mod tests {
     fn accounting_regression_every_accepted_picture_is_accounted_for() {
         assert!(check_drain_count(24, 24).is_ok());
         assert!(check_drain_count(0, 0).is_ok());
+    }
+
+    /// The picture the availability probe sends has to be the export's own picture: an NV12
+    /// buffer of the right size, and a refusal for a picture that is too short rather than a read
+    /// past its end.
+    #[test]
+    fn the_picture_the_probe_sends_is_nv12_of_the_right_size() {
+        let (w, h) = (64u32, 32u32);
+        let rgba = vec![0x80u8; (w as usize) * (h as usize) * 4];
+        let mut planes = Planes::default();
+        let needed = pack_nv12(&mut planes, &rgba, w, h).unwrap();
+        assert_eq!(needed, (w as usize) * (h as usize) * 3 / 2);
+        assert_eq!(planes.nv12.len(), needed);
+        // a short picture is refused
+        let mut short = Planes::default();
+        assert!(pack_nv12(&mut short, &rgba[..rgba.len() - 4], w, h).is_err());
+    }
+
+    /// The availability answer has to come from an encoder that really encoded a picture.
+    ///
+    /// Opening a session is not enough: on an Intel UHD 750 the "Intel Hardware H265 Encoder MFT"
+    /// opens without complaint and then refuses every picture, so a probe that only opened offered
+    /// H.265 on a machine where no H.265 export could succeed. Here the probe has to come back
+    /// with a picture in its hands, which is what tells it apart from a probe that only opened.
+    ///
+    /// On a machine with no Media Foundation hardware encoder there is nothing to check.
+    /// The availability answer has to come from an encoder that really encoded a picture.
+    ///
+    /// Opening a session is not enough: on an Intel UHD 750 the "Intel Hardware H265 Encoder MFT"
+    /// opens without complaint and then refuses every picture, so a probe that only opened offered
+    /// H.265 on a machine where no H.265 export could succeed. Here the probe has to come back
+    /// with a picture in its hands, which is what tells it apart from a probe that only opened.
+    ///
+    /// On a machine with no Media Foundation hardware encoder there is nothing to check.
+    #[test]
+    fn the_probe_has_the_encoder_encode_a_picture() {
+        let Ok(api) = super::super::mft::api() else { return };
+        match probe(api, &h264_probe_spec()) {
+            Ok(frames) => assert!(frames > 0, "a probe that answers yes has encoded a picture"),
+            Err(why) => eprintln!("no Media Foundation hardware H.264 encoder here: {why}"),
+        }
+    }
+
+    /// The export path has to still encode: the picture the probe sends is converted the way an
+    /// export's picture is, so a mistake in that conversion would show up here.
+    ///
+    /// On a machine with no Media Foundation hardware encoder there is nothing to check.
+    #[test]
+    fn the_export_path_encodes_a_picture() {
+        let s = settings(Format::H264);
+        let Some(enc) = factory(Format::H264, 640, 360, FrameRate::FPS_24, &s) else { return };
+        let mut enc = enc.expect("a hardware H.264 encoder");
+        let rgba = vec![0x40u8; 640 * 360 * 4];
+        let frame = EncoderFrame { width: 640, height: 360, rgba: &rgba, hdr: None, index: 0 };
+        let mut packets = enc.encode(&frame).expect("the encoder took the picture");
+        // The encoder is not waited for mid-stream — that is what keeps an export at render speed —
+        // so the picture comes back when the export drains.
+        packets.extend(enc.flush().expect("the encoder drained"));
+        assert!(!packets.is_empty(), "the encoder gave a picture back");
     }
 }
