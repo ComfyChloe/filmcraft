@@ -148,23 +148,6 @@ fn config(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -
     })
 }
 
-/// Whether NVENC serves this format on this machine, so Media Foundation never would.
-///
-/// NVENC is registered after Media Foundation and each `register_encoder` tries the most recently
-/// registered one first, so where NVENC is available Media Foundation does not take the export —
-/// and the format list asks NVENC's probe first and stops there. So on such a machine the
-/// Media Foundation probe's answer has no effect, and asking it costs the GPU's encoder: on an
-/// NVIDIA machine Media Foundation's encoder MFT and NVENC drive the same one.
-fn nvenc_serves(format: Format) -> bool {
-    if format == Format::Hevc {
-        crate::nvenc::hevc_available()
-    } else {
-        // `nvenc::available` opens a session every time it is asked, so the answer is kept here.
-        static NVENC: OnceLock<bool> = OnceLock::new();
-        *NVENC.get_or_init(crate::nvenc::available)
-    }
-}
-
 /// The Export encoder factory (see the module documentation).
 pub fn factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
     // H.264 is opt-in per export: its output depends on the machine, while the built-in encoder's
@@ -186,20 +169,11 @@ pub fn factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettin
     // encode is not offered the format at all. Without this, a machine with a broken vendor
     // encoder — an Intel UHD 750 whose HEVC MFT opens and then refuses every picture — would fail
     // an export half way through instead of falling back to the software encoder.
-    //
-    // It is only worth asking where Media Foundation could actually serve the export. NVENC is
-    // registered after Media Foundation and each `register_encoder` tries the most recently
-    // registered one first, so on an NVIDIA machine Media Foundation does not take the export at
-    // all — and Media Foundation's NVIDIA encoder MFT and NVENC drive the same GPU encoder, so a
-    // probe that encodes there is a second use of the same engine where none was needed.
-    if !nvenc_serves(format) {
-        let usable = if hard { hevc_available() } else { h264_available() };
-        if !usable {
-            let why = if hard { "no hardware H.265 encoder that can encode a picture" } else { "no hardware H.264 encoder that can encode a picture" };
-            log::info!("{why}");
-            // H.265 has no software encoder to fall back to, so the format is simply not available.
-            return if hard { None } else { declined(why, false) };
-        }
+    if !(if hard { hevc_available() } else { h264_available() }) {
+        let why = if hard { "no hardware H.265 encoder that can encode a picture" } else { "no hardware H.264 encoder that can encode a picture" };
+        log::info!("{why}");
+        // H.265 has no software encoder to fall back to, so the format is simply not available.
+        return if hard { None } else { declined(why, false) };
     }
     let spec = EncSpec {
         subtype: cfg.subtype,
@@ -565,11 +539,40 @@ fn probe(api: &'static MfApi, spec: &EncSpec) -> std::result::Result<usize, Stri
     Ok(frames.len())
 }
 
-/// Whether this machine has a hardware H.264 encoder, by encoding one picture with it (asked
-/// once). A machine has an H.264 encoder or an HEVC one or both; a caller counting which factory
-/// takes an export needs to know whether anything will before the software encoder does.
+/// Whether NVENC serves this format on this machine, so Media Foundation never would.
+///
+/// NVENC is registered after Media Foundation and each `register_encoder` tries the most recently
+/// registered one first, so where NVENC is available Media Foundation does not take the export —
+/// and the format list asks NVENC's probe first and stops there. So on such a machine the
+/// Media Foundation probe's answer has no effect, and asking it costs the GPU's encoder: on an
+/// NVIDIA machine Media Foundation's encoder MFT and NVENC drive the same one.
+fn nvenc_serves(format: Format) -> bool {
+    if format == Format::Hevc {
+        crate::nvenc::hevc_available()
+    } else {
+        // `nvenc::available` opens a session every time it is asked, so the answer is kept here.
+        static NVENC: OnceLock<bool> = OnceLock::new();
+        *NVENC.get_or_init(crate::nvenc::available)
+    }
+}
+
+/// Whether this machine has a hardware H.264 encoder an export can use.
+///
+/// Where NVENC serves H.264, Media Foundation does not take the export — NVENC is registered after
+/// Media Foundation and each `register_encoder` tries the most recently registered one first — so
+/// the answer is NVENC's and Media Foundation's encoder is not touched at all. That matters on an
+/// NVIDIA machine: Media Foundation's NVIDIA H.264 Encoder MFT and NVENC drive the same GPU
+/// encoder, and once Media Foundation's encoder MFT has been used the next NVENC session has failed
+/// to open (`NV_ENC_ERR_INVALID_VERSION`), measured by @Kii-secondary on an RTX 3090.
+///
+/// Where Media Foundation could serve the export, the answer is the probe's: it has the encoder
+/// encode a picture, so a machine whose encoder opens and then refuses every picture is not offered
+/// the format.
 pub fn h264_available() -> bool {
     *H264_PROBE.get_or_init(|| {
+        if nvenc_serves(Format::H264) {
+            return true;
+        }
         let Ok(api) = super::mft::api() else { return false };
         match probe(api, &h264_probe_spec()) {
             Ok(_) => true,
@@ -581,11 +584,16 @@ pub fn h264_available() -> bool {
     })
 }
 
-/// Whether this machine has a hardware HEVC encoder, which is what makes `Format::Hevc` available
-/// (asked once, by encoding one picture with it). Registered alongside NVENC's probe, so a machine
-/// with either encoder offers the format.
+/// Whether this machine has a hardware HEVC encoder an export can use.
+///
+/// As with [`h264_available`]: where NVENC serves H.265 the answer is NVENC's and Media
+/// Foundation's encoder is not touched at all; where Media Foundation could serve the export, the
+/// answer is the probe's, and the probe has the encoder encode a picture.
 pub fn hevc_available() -> bool {
     *HEVC_PROBE.get_or_init(|| {
+        if nvenc_serves(Format::Hevc) {
+            return true;
+        }
         let Ok(api) = super::mft::api() else { return false };
         match probe(api, &hevc_probe_spec()) {
             Ok(_) => true,
