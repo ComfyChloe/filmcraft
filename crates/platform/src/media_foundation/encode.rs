@@ -77,6 +77,13 @@ struct Config {
     subtype: windows::core::GUID,
     /// `MF_MT_MPEG2_PROFILE` to ask for, where the codec has a defined mapping.
     profile: Option<u32>,
+    /// `MF_MT_MAX_KEYFRAME_SPACING` for the output: the maximum number of frames between
+    /// keyframes, which is what the export asks for. `None` leaves the driver's own default.
+    keyint: Option<u32>,
+    /// `MF_MT_PIXEL_ASPECT_RATIO` for the output, as (numerator, denominator): the picture's pixel
+    /// aspect ratio, which the encoder writes into the sequence parameter set. `None` leaves the
+    /// picture square.
+    pixel_aspect: Option<(u32, u32)>,
 }
 
 /// Why Media Foundation does not take this export (the software encoder does, for H.264), or the
@@ -145,6 +152,12 @@ fn config(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -
                 H264Profile::High => eAVEncH264VProfile_High.0 as u32,
             })
         },
+        // The keyframe interval the export asked for, in frames, as the software and NVENC paths
+        // get it: the same two-second default when the export does not say.
+        keyint: Some(s.keyframe_distance.filter(|k| *k > 0).unwrap_or_else(|| (num as f64 / den as f64 * 2.0).round().max(1.0) as u32)),
+        // The picture's pixel aspect ratio, which the encoder writes into the sequence parameter
+        // set. HEVC has declined a non-square one above; H.264 carries it.
+        pixel_aspect: s.pixel_aspect.filter(|(n, d)| *n != *d),
     })
 }
 
@@ -183,6 +196,8 @@ pub fn factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettin
         rate: cfg.rate,
         bitrate: cfg.bitrate_bps,
         cbr: cfg.cbr,
+        keyint: cfg.keyint,
+        pixel_aspect: cfg.pixel_aspect,
     };
     let mft = match super::open(api, &spec) {
         Ok(m) => m,
@@ -478,6 +493,8 @@ fn h264_probe_spec() -> EncSpec {
         rate: (30, 1),
         bitrate: 2_000_000,
         cbr: false,
+        keyint: None,
+        pixel_aspect: None,
     }
 }
 
@@ -491,6 +508,8 @@ fn hevc_probe_spec() -> EncSpec {
         rate: (30, 1),
         bitrate: 2_000_000,
         cbr: false,
+        keyint: None,
+        pixel_aspect: None,
     }
 }
 
@@ -743,6 +762,9 @@ mod tests {
         let par = ExportSettings { pixel_aspect: Some((4, 3)), ..s.clone() };
         assert!(config(Format::H264, 1280, 720, FrameRate::FPS_24, &par).is_ok());
         assert!(config(Format::Hevc, 1280, 720, FrameRate::FPS_24, &par).is_err());
+        // and the H.264 path really carries it, rather than only accepting the request
+        assert_eq!(config(Format::H264, 1280, 720, FrameRate::FPS_24, &par).unwrap().pixel_aspect, Some((4, 3)));
+        assert_eq!(config(Format::H264, 1280, 720, FrameRate::FPS_24, &s).unwrap().pixel_aspect, None, "a square picture carries no ratio");
 
         // hostile sizes and frame rates
         assert!(config(Format::H264, 641, 360, FrameRate::FPS_24, &s).is_err());
@@ -841,6 +863,23 @@ mod tests {
     fn accounting_regression_every_accepted_picture_is_accounted_for() {
         assert!(check_drain_count(24, 24).is_ok());
         assert!(check_drain_count(0, 0).is_ok());
+    }
+
+    /// The keyframe interval the export asks for reaches the encoder, as it does for the software
+    /// and NVENC paths. Without it the driver's own default is used and the file's keyframes are
+    /// not where the export said they would be.
+    #[test]
+    fn the_keyframe_interval_reaches_the_encoder() {
+        let s = settings(Format::H264);
+        let asked = ExportSettings { keyframe_distance: Some(12), ..s.clone() };
+        assert_eq!(config(Format::H264, 1280, 720, FrameRate::FPS_24, &asked).unwrap().keyint, Some(12));
+        // and the default is two seconds, as the software and NVENC paths use
+        let default = config(Format::H264, 1280, 720, FrameRate::FPS_24, &s).unwrap();
+        assert_eq!(default.keyint, Some(48), "24 fps for two seconds");
+        // a zero interval is not one, so it falls back to the default rather than to a keyframe
+        // every picture
+        let zero = ExportSettings { keyframe_distance: Some(0), ..s.clone() };
+        assert_eq!(config(Format::H264, 1280, 720, FrameRate::FPS_24, &zero).unwrap().keyint, Some(48));
     }
 
     /// The picture the availability probe sends has to be the export's own picture: an NV12
