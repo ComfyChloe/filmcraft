@@ -288,13 +288,15 @@ struct Planes {
 /// One RGBA picture converted into `planes.nv12`, returning how many bytes it holds.
 ///
 /// Free-standing, so that the availability probe can convert a picture exactly the way an export
-/// does without an export's encoder around it.
+/// does without an export's encoder around it. The conversion is **not** timed here: the probe is
+/// not an export, and the export stage timings are a total since the process started, so a probe's
+/// conversion would show up as the export's.
 fn pack_nv12(planes: &mut Planes, rgba: &[u8], width: u32, height: u32) -> Result<usize> {
     let (w, h) = (width as usize, height as usize);
     if rgba.len() < w.saturating_mul(h).saturating_mul(4) {
         return Err(ExportError::Encode("the RGBA picture is smaller than its size".into()));
     }
-    filmcraft_export::timed(filmcraft_export::Stage::Convert, || filmcraft_export::rgba_to_yuv420_8(rgba, w, h, &mut planes.y, &mut planes.u, &mut planes.v));
+    filmcraft_export::rgba_to_yuv420_8(rgba, w, h, &mut planes.y, &mut planes.u, &mut planes.v);
     let luma = w * h;
     let needed = luma + luma / 2;
     if planes.nv12.len() < needed {
@@ -382,7 +384,9 @@ impl MfVideoEncoder {
                 f.width, f.height, self.cfg.size.0, self.cfg.size.1
             )));
         }
-        pack_nv12(&mut self.planes, f.rgba, self.cfg.size.0, self.cfg.size.1)
+        // The conversion is the export's `Convert` stage. The probe converts the same way but is
+        // not an export, so it is not timed.
+        filmcraft_export::timed(filmcraft_export::Stage::Convert, || pack_nv12(&mut self.planes, f.rgba, self.cfg.size.0, self.cfg.size.1))
     }
 
     /// Everything the MFT has finished, as MP4 samples, waiting up to `budget` for an asynchronous one.
