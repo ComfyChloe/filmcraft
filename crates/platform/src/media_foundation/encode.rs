@@ -163,6 +163,19 @@ fn config(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -
 
 /// The Export encoder factory (see the module documentation).
 pub fn factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
+    // Where NVENC serves this format, Media Foundation must not take it. On an NVIDIA machine
+    // Media Foundation's encoder MFT is NVIDIA's own - the same GPU encoder NVENC drives, behind a
+    // second API - and an export that NVENC declines and Media Foundation then takes leaves NVENC
+    // unable to open a session for the rest of the process: measured on an RTX 3090, "opening the
+    // NVENC session failed (15)" (NV_ENC_ERR_INVALID_VERSION) on every NVENC test that follows,
+    // while the same suite on main - which registers Media Foundation's DECODER but not its
+    // encoder - is green. So where NVENC can do the format, Media Foundation declines it.
+    //
+    // Where NVENC cannot do the format - no NVIDIA driver, or a card whose encoder has no HEVC -
+    // Media Foundation is another vendor's encoder, on another engine, and is welcome to take it.
+    if nvenc_serves(format) {
+        return None;
+    }
     // H.264 is opt-in per export: its output depends on the machine, while the built-in encoder's
     // is byte-identical everywhere. H.265 has no software encoder, so choosing the format is the
     // opt-in and the Hardware encoding toggle does not apply (as with NVENC and VideoToolbox).
