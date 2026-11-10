@@ -430,6 +430,11 @@ impl VideoEncoder for MfVideoEncoder {
     fn name(&self) -> &'static str {
         "Media Foundation"
     }
+    /// The stable identifier, beside the readable name: without it this encoder would report
+    /// the default "software" and a Media Foundation export would look like a software one.
+    fn id(&self) -> &'static str {
+        "media_foundation"
+    }
     fn sample_entry(&self) -> SampleEntry {
         // Only complete once the encoder has written its parameter sets; the export asks again
         // after the first picture, which is when they exist.
@@ -692,6 +697,20 @@ mod tests {
         assert!(factory(Format::H264, 640, 360, FrameRate::FPS_24, &h264).is_none());
         let hevc = ExportSettings { signal, ..settings(Format::Hevc) };
         assert!(matches!(factory(Format::Hevc, 640, 360, FrameRate::FPS_24, &hevc), Some(Err(ExportError::Unsupported(_)))));
+    }
+
+    #[test]
+    fn the_encoder_names_itself_and_its_stable_id() {
+        let request = settings(Format::H264);
+        let Some(result) = factory(Format::H264, 640, 360, FrameRate::FPS_24, &request) else {
+            eprintln!("SKIPPED: no Media Foundation H.264 encoder");
+            return;
+        };
+        let encoder = result.expect("Media Foundation H.264 encoder");
+        assert_eq!(encoder.name(), "Media Foundation", "the readable name");
+        // The stable identifier beside it: without this the export would report the default
+        // "software" and a Media Foundation export would look like a software one.
+        assert_eq!(encoder.id(), "media_foundation");
     }
 
     #[test]

@@ -85,6 +85,9 @@ impl VideoEncoder for NvencEncoder {
     fn name(&self) -> &'static str {
         "NVENC"
     }
+    fn id(&self) -> &'static str {
+        "nvenc"
+    }
 
     fn sample_entry(&self) -> SampleEntry {
         let (sps, pps) = self.enc.parameter_sets();

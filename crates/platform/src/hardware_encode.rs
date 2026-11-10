@@ -240,6 +240,9 @@ impl VideoEncoder for HardwareEncoder {
     fn name(&self) -> &'static str {
         "VideoToolbox"
     }
+    fn id(&self) -> &'static str {
+        "videotoolbox"
+    }
 
     fn sample_entry(&self) -> SampleEntry {
         let c = self.vt.config();
@@ -343,6 +346,10 @@ mod tests {
 
     /// Three pictures through the `VideoEncoder` adapter: one compressed frame each.
     fn encodes_three(enc: &mut HardwareEncoder) {
+        // The adapter names itself and its stable identifier, so an export says which encoder
+        // wrote the file and a consumer can compare it across versions.
+        assert_eq!(enc.name(), "VideoToolbox");
+        assert_eq!(enc.id(), "videotoolbox", "the stable identifier");
         let mut packets = Vec::new();
         for i in 0..3u64 {
             let px = picture(i);

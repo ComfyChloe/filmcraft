@@ -140,7 +140,7 @@ impl Progress {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Report {
     pub path: String,
     pub frames: u64,
@@ -148,7 +148,7 @@ pub struct Report {
     pub bytes: u64,
     pub render_fps: f64,
     /// Further files written besides `path` (MXF OP-Atom audio files).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_files: Vec<String>,
     /// What wrote the stream: "software H.264", "NVENC H.264", "Media Foundation H.265",
     /// "software GIF". An image sequence writes stills, so it leaves this empty.
@@ -156,6 +156,12 @@ pub struct Report {
     /// this says so - the same bytes under a different name are not the same file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub encoder: String,
+    /// A stable identifier of the encoder that wrote the stream: "software", "nvenc",
+    /// "videotoolbox", "media_foundation". A consumer compares this; `encoder` is the
+    /// readable text. An image sequence, and every report that is not an export, leaves it
+    /// empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub encoder_id: String,
     /// Why the hardware encoder declined, when one did and the software encoder took over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declined: Option<String>,

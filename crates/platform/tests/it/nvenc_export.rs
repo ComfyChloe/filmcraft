@@ -81,8 +81,9 @@ fn hardware_export_matches_the_software_export() {
     let (p, seq, m) = project(1280, 720, 72);
     let soft_path = tmp("soft.mp4");
     let before_soft = hw_encode_stats();
-    export(&p, seq, &settings(soft_path.clone(), HardwareEncoding::Off), &m, &Progress::default()).unwrap();
+    let soft_report = export(&p, seq, &settings(soft_path.clone(), HardwareEncoding::Off), &m, &Progress::default()).unwrap();
     assert_eq!(hw_encode_stats(), before_soft, "Off: no hardware encoder attempt");
+    assert_eq!(soft_report.encoder_id, "software", "the stable identifier");
 
     let hw_path = tmp("hw.mp4");
     let before = hw_encode_stats();
@@ -99,7 +100,19 @@ fn hardware_export_matches_the_software_export() {
         return;
     }
     assert_eq!(report.frames, 72);
-    assert_eq!(after.frames - before.frames, 72, "every picture went through NVENC");
+    // The stable identifier names the encoder that took the export, whichever it is: NVENC on
+    // an NVIDIA box, Media Foundation on Windows without one (it declines a format NVENC can
+    // do, so on an NVIDIA Windows box NVENC takes it). It must agree with the readable name,
+    // and it must not be the software default - a hardware session took this export.
+    assert_ne!(report.encoder_id, "software", "a hardware encoder took the export");
+    let named = match report.encoder_id.as_str() {
+        "nvenc" => "NVENC",
+        "media_foundation" => "Media Foundation",
+        "videotoolbox" => "VideoToolbox",
+        other => panic!("unknown encoder identifier {other:?}"),
+    };
+    assert!(report.encoder.starts_with(named), "the identifier and the readable name agree: {} / {}", report.encoder_id, report.encoder);
+    assert_eq!(after.frames - before.frames, 72, "every picture went through the hardware encoder");
 
     let (soft, hard) = (decode(&soft_path), decode(&hw_path));
     assert_eq!((soft.len(), hard.len()), (72, 72), "frame counts");
